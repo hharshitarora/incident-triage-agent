@@ -1,0 +1,8 @@
+[2026-08-28 03:14:22,481] INFO  storefront.api  request_id=af31c9 POST /checkout order=88213
+[2026-08-28 03:14:22,502] ERROR storefront.api  request_id=af31c9 checkout failed for order 88213 promo=SUMMER25
+Traceback (most recent call last):
+  File "orders.py", line 13, in checkout
+    total = apply_discount(subtotal, promo_code)
+  File "pricing.py", line 6, in apply_discount
+    rate = DISCOUNTS[code]
+KeyError: 'SUMMER25'

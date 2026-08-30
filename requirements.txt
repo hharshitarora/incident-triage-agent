@@ -1,0 +1,9 @@
+langgraph>=0.2
+langchain-openai>=0.2
+langchain-core>=0.3
+pydantic>=2.7
+python-dotenv>=1.0
+requests>=2.31
+tenacity>=8.2
+opentelemetry-api>=1.25
+opentelemetry-sdk>=1.25
