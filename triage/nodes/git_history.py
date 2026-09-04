@@ -36,17 +36,82 @@ def _diff(repo: str, sha: str, files: list[str]) -> str:
     return patch[:_PATCH_LIMIT] + ("\n... (truncated)" if len(patch) > _PATCH_LIMIT else "")
 
 
+def _resolve_paths(repo: str, files: list[str]) -> tuple[list[str], list[str]]:
+    """Map paths from a traceback onto paths git actually tracks.
+
+    A stack trace reports where code ran, not where it lives in the repo:
+    "/srv/app/settings.py" in production is "app/settings.py" in git. Passing
+    the deployment path straight to `git log --` matches nothing, and git exits
+    0 while doing it, so the phase reported success with zero commits and the
+    report node silently lost its best evidence.
+
+    Resolution is by longest unique path suffix, which handles container
+    prefixes, absolute paths and Windows separators without guessing. If a
+    suffix is ambiguous (`utils.py` in four packages) every candidate is kept:
+    ranking is the next step's job, and dropping evidence here is worse.
+    """
+    listing = _git(repo, "ls-files")
+    tracked = [t for t in listing.stdout.splitlines() if t.strip()]
+    if not tracked:
+        return [f for f in files if f != "."], []
+
+    tracked_set = set(tracked)
+    resolved: list[str] = []
+    unresolved: list[str] = []
+
+    for raw in files:
+        if raw == ".":
+            continue
+        norm = raw.replace("\\", "/").lstrip("/")
+        if norm in tracked_set:
+            resolved.append(norm)
+            continue
+
+        parts = norm.split("/")
+        matches: list[str] = []
+        for i in range(len(parts)):
+            suffix = "/".join(parts[i:])
+            matches = [t for t in tracked if t == suffix or t.endswith("/" + suffix)]
+            if matches:
+                break
+        if matches:
+            resolved.extend(m for m in matches if m not in resolved)
+        else:
+            unresolved.append(raw)
+
+    return resolved, unresolved
+
+
 def git_history(state: TriageState) -> dict:
     with span("git_history"):
         repo = state["repo_path"]
         warnings = list(state.get("warnings", []))
 
-        if _git(repo, "rev-parse", "--is-inside-work-tree").returncode != 0:
-            warnings.append(f"git_history: '{repo}' is not a git repository — skipping")
+        probe = _git(repo, "rev-parse", "--is-inside-work-tree")
+        if probe.returncode != 0:
+            # Report why, not just that. Every non-zero exit used to be labelled
+            # "not a git repository", which is wrong for the common cases: a repo
+            # git refuses to trust ("detected dubious ownership", routine on
+            # Windows drives that record no ownership), a bad path, or git
+            # missing from PATH. All three were reported as an absent repo,
+            # which sends anyone debugging it to entirely the wrong place.
+            detail = (probe.stderr or probe.stdout).strip().splitlines()
+            reason = detail[0].strip() if detail else f"git exited {probe.returncode}"
+            if "not a git repository" in reason:
+                reason = f"'{repo}' is not a git repository"
+            warnings.append(f"git_history: skipped, {reason}")
             return {"suspect_commits": [], "warnings": warnings}
 
         parsed = state.get("parsed_error")
-        files = list(parsed.implicated_files) if parsed and parsed.implicated_files else ["."]
+        reported = list(parsed.implicated_files) if parsed and parsed.implicated_files else ["."]
+
+        files, unresolved = _resolve_paths(repo, reported)
+        if unresolved:
+            warnings.append(
+                "git_history: no tracked file matches " + ", ".join(unresolved[:4])
+            )
+        if not files:
+            files = ["."]
 
         commits: dict[str, SuspectCommit] = {}
         for f in files:
