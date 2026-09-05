@@ -8,6 +8,11 @@ An orchestrated agent that automates the first twenty minutes of every productio
 
 This is the open, generalized version of an incident-triage workflow I built in production at a large retailer (where it cut failure-investigation time 50–60%) — rebuilt from scratch as a proper orchestrator so each investigation phase is independently controllable and swappable. See [`DECISIONS.md`](./DECISIONS.md) for the why.
 
+![demo](docs/demo.gif)
+
+Given only the crash log, it walks git history and names the commit that caused
+it, with the owner and a calibrated confidence.
+
 ## How it works
 
 Four independently-controllable phases, wired with LangGraph:
