@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import os
 import shutil
+import stat
 import subprocess
+import sys
 import textwrap
 from pathlib import Path
 
@@ -45,9 +47,30 @@ def commit(msg: str, name: str, email: str, date: str) -> None:
     )
 
 
+def force_rmtree(path: Path) -> None:
+    """Delete the sandbox on Windows too.
+
+    Git writes objects read-only and Windows refuses to unlink a read-only file,
+    so a plain rmtree raises PermissionError on the *second* run of this script.
+    Worse than the crash: it leaves a half-deleted .sandbox that is no longer a
+    git repo, and because that directory sits inside this repo, the agent then
+    silently investigates its parent instead and reports "Suspect: unclear".
+    """
+    if not path.exists():
+        return
+
+    def _retry(func, target, _exc):
+        os.chmod(target, stat.S_IWRITE)
+        func(target)
+
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=_retry)
+    else:
+        shutil.rmtree(path, onerror=_retry)
+
+
 def main() -> None:
-    if SANDBOX.exists():
-        shutil.rmtree(SANDBOX)
+    force_rmtree(SANDBOX)
     SANDBOX.mkdir(parents=True)
     git("init", "-q")
     git("config", "commit.gpgsign", "false")

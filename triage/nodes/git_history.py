@@ -5,6 +5,8 @@ the actual culprit, so we keep it fully inspectable.
 """
 from __future__ import annotations
 
+import os
+import re
 import subprocess
 
 from ..observability import span
@@ -14,7 +16,14 @@ _SEP = "\x1f"
 
 
 _PATCH_LIMIT = 1500  # chars; keep prime-suspect diffs small enough for the prompt
-_PRIME_SUSPECTS = 2  # how many top commits get their diff attached
+_PRIME_SUSPECTS = 3  # how many top commits get their diff attached
+_MAX_CANDIDATES = 10  # commits whose diff we fetch and score locally
+
+# Words that appear in almost every traceback and discriminate nothing.
+_NOISE = frozenset("""
+error none self true false object attribute line file module traceback
+main run call args kwargs return type value key index name str int
+""".split())
 
 
 def _git(repo: str, *args: str) -> subprocess.CompletedProcess:
@@ -34,6 +43,121 @@ def _diff(repo: str, sha: str, files: list[str]) -> str:
         return ""
     patch = r.stdout.strip()
     return patch[:_PATCH_LIMIT] + ("\n... (truncated)" if len(patch) > _PATCH_LIMIT else "")
+
+
+def _error_tokens(parsed) -> set[str]:
+    """Identifiers the error is actually about."""
+    if parsed is None:
+        return set()
+    text = " ".join(filter(None, [parsed.error_type, parsed.message, parsed.signature]))
+    tokens = {t.lower() for t in re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", text)}
+    for frame in (parsed.stack_frames or []):
+        if frame.function:
+            tokens.add(frame.function.lower())
+    return tokens - _NOISE
+
+
+def _raising_file(parsed) -> str:
+    """The file in the deepest frame: where the exception actually came from."""
+    frames = getattr(parsed, "stack_frames", None) or []
+    return frames[-1].file.replace("\\", "/").split("/")[-1] if frames else ""
+
+
+def _failing_source(parsed) -> str:
+    frames = getattr(parsed, "stack_frames", None) or []
+    for frame in reversed(frames):
+        if frame.source:
+            return " ".join(frame.source.split())
+    return ""
+
+
+def _relevance(patch: str, tokens: set[str]) -> float:
+    """How much a commit's diff has to do with the reported error.
+
+    Weighted so that *removing* a line mentioning the error's subject counts for
+    more than adding one. Most regressions are a deleted guard, a dropped
+    default, or a removed argument: the bug is in what is no longer there.
+
+    A mention only in surrounding context is worth little, since a docstring
+    commit touching the same function picks that up for free.
+    """
+    if not patch or not tokens:
+        return 0.0
+    removed, added = [], []
+    for line in patch.splitlines():
+        if line.startswith("-") and not line.startswith("---"):
+            removed.append(line[1:].lower())
+        elif line.startswith("+") and not line.startswith("+++"):
+            added.append(line[1:].lower())
+    context = patch.lower()
+
+    score = 0.0
+    for token in tokens:
+        in_removed = any(token in line for line in removed)
+        in_added = any(token in line for line in added)
+        if in_removed:
+            # Changed or deleted. Either way the commit altered behaviour the
+            # error is about, which is what a regression looks like.
+            score += 3.0
+        elif in_added:
+            # Added only. Weighted low on purpose: the commit that first creates
+            # a file mentions every identifier in it, so without this the
+            # initial commit outranks the change that actually broke something.
+            score += 0.5
+        elif token in context:
+            score += 0.25
+    return round(score / len(tokens), 4)
+
+
+def _boosted(base: float, patch: str, commit_files: list[str],
+             raising_file: str, failing_source: str) -> float:
+    """Weight a commit by how much it looks like a regression, not a creation.
+
+    Four adjustments, all weights rather than filters, because the change that
+    breaks a call site is often not in the file that raises.
+
+    **Raising file.** The exception came from somewhere specific. Without this,
+    a commit in a neighbouring module outscores the culprit purely by mentioning
+    the same identifier: for `zero_division`, a report file whose diff removed a
+    line containing `mean` beat the stats file that deleted the empty-list
+    guard, because the guard's own lines never say `mean`.
+
+    **File creation.** A diff carrying `new file mode` wrote the code; it did not
+    change it. It also mentions every identifier in the file for free, so it wins
+    any token-overlap contest it is allowed to enter. It is almost never the
+    regression, and this was the single biggest source of wrong answers while
+    tuning: `Add stats helpers` outranking `Inline the empty check`.
+
+    **Deletions.** Regressions remove things: a guard, a default, an argument.
+    The removed lines usually say nothing about the error, which is exactly why
+    token overlap alone cannot find them, so having deletions at all is its own
+    signal.
+
+    **The failing line**, but only for commits that also delete something. The
+    author who first wrote the line is not the author who broke it, and without
+    that condition this bonus rewards the original commit.
+    """
+    score = base
+    has_deletions = any(
+        line.startswith("-") and not line.startswith("---")
+        for line in patch.splitlines()
+    )
+
+    if raising_file and any(f.split("/")[-1] == raising_file for f in commit_files):
+        score *= 1.75
+    if "new file mode" in patch:
+        score *= 0.25
+    if has_deletions:
+        score *= 1.4
+    if failing_source and has_deletions:
+        added = " ".join(
+            " ".join(line[1:].split())
+            for line in patch.splitlines()
+            if line.startswith("+") and not line.startswith("+++")
+        )
+        if failing_source in added:
+            score += 1.5
+    return round(score, 4)
 
 
 def _resolve_paths(repo: str, files: list[str]) -> tuple[list[str], list[str]]:
@@ -102,6 +226,22 @@ def git_history(state: TriageState) -> dict:
             warnings.append(f"git_history: skipped, {reason}")
             return {"suspect_commits": [], "warnings": warnings}
 
+        # `--is-inside-work-tree` succeeds for any subdirectory of a repo, so a
+        # path that is merely *inside* one passes the check above and the agent
+        # then investigates the wrong project's history without saying so. That
+        # is not hypothetical: a half-built demo sandbox inside this repo did
+        # exactly that, and the only symptom was an unexplained "unclear".
+        toplevel = _git(repo, "rev-parse", "--show-toplevel").stdout.strip()
+        if toplevel:
+            want = os.path.realpath(repo)
+            got = os.path.realpath(toplevel)
+            if os.path.normcase(want) != os.path.normcase(got):
+                warnings.append(
+                    f"git_history: skipped, '{repo}' is not a repository root; "
+                    f"it sits inside '{got}'"
+                )
+                return {"suspect_commits": [], "warnings": warnings}
+
         parsed = state.get("parsed_error")
         reported = list(parsed.implicated_files) if parsed and parsed.implicated_files else ["."]
 
@@ -133,10 +273,38 @@ def git_history(state: TriageState) -> dict:
                 if f != "." and f not in c.files:
                     c.files.append(f)
 
-        # Most recent first, then attach diffs to the prime suspects only.
-        suspects = sorted(commits.values(), key=lambda c: c.date, reverse=True)[:8]
-        for suspect in suspects[:_PRIME_SUSPECTS]:
-            suspect.patch = _diff(repo, suspect.sha, files)
+        # Rank by relevance to the error, not by recency.
+        #
+        # This used to sort by date and attach diffs to the two newest commits.
+        # That is a trap the eval suite exposed: when a docstring tweak lands
+        # after the real regression, the culprit's diff is never shown to the
+        # report node at all, while two unrelated recent diffs are. The prompt
+        # then asks the model to "cite the exact change", and the only changes
+        # it can see are the wrong ones. It was not reasoning badly; it was
+        # choosing from the wrong shortlist.
+        #
+        # Scoring stays deterministic and local: fetch each candidate's diff and
+        # measure overlap with the identifiers the error names. Recency is only
+        # a tiebreaker now.
+        tokens = _error_tokens(parsed)
+        raising_file = _raising_file(parsed)
+        failing_source = _failing_source(parsed)
+        candidates = sorted(commits.values(), key=lambda c: c.date, reverse=True)[:_MAX_CANDIDATES]
+
+        scored = []
+        for candidate in candidates:
+            patch = _diff(repo, candidate.sha, files)
+            base = _relevance(patch, tokens)
+            score = _boosted(base, patch, candidate.files, raising_file, failing_source)
+            scored.append((score, candidate.date, candidate, patch))
+        scored.sort(key=lambda row: (row[0], row[1]), reverse=True)
+
+        suspects = []
+        for rank, (score, _, candidate, patch) in enumerate(scored[:8]):
+            candidate.why = f"relevance {score:.2f} to {sorted(tokens)[:5]}"
+            # Only the top few carry their diff into the prompt, to bound size.
+            candidate.patch = patch if rank < _PRIME_SUSPECTS else ""
+            suspects.append(candidate)
 
         note = f"git_history: {len(suspects)} suspect commit(s) across {len(files)} file(s)"
         return {

@@ -12,7 +12,9 @@ Extract:
 - message: the human-readable error message
 - signature: a SHORT, STABLE signature good for dedup/search (strip line numbers,
   timestamps, memory addresses, and request ids)
-- stack_frames: file / line / function for each frame you can see
+- stack_frames: file / line / function for each frame you can see, plus
+  `source`: the code line printed under that frame, copied verbatim.
+  The last frame is where the exception was raised.
 - implicated_files: the repo-relative source files most likely at fault
 
 Only use information present in the log. Leave a field empty if it is not present.

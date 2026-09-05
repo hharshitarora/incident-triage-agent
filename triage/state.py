@@ -14,6 +14,10 @@ class StackFrame(BaseModel):
     file: str
     line: Optional[int] = None
     function: Optional[str] = None
+    source: Optional[str] = Field(
+        default=None,
+        description="the source line shown for this frame, verbatim, if the log includes it",
+    )
 
 
 class ParsedError(BaseModel):
